@@ -29,6 +29,7 @@ from torch.utils.data import DataLoader, TensorDataset
 import matplotlib.pyplot as plt
 import seaborn as sns
 import os
+import time
 
 # ==========================================
 # 1. HARDWARE & DATA INITIALIZATION
@@ -49,14 +50,24 @@ torch.manual_seed(42)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(42)
 
-print("\nGenerating PCOF tensors (BFloat16)...")
-X = torch.randn(N_SAMPLES, SEQ_LEN, D_MODEL, dtype=torch.bfloat16, device=device)
-true_func_features = X[:, :, :D_FUNC].mean(dim=1).to(torch.float32)
-W_true = torch.randn(D_FUNC, 1, dtype=torch.float32, device=device)
-y = torch.matmul(true_func_features, W_true).to(torch.bfloat16)
+print("\nGenerating PCOF tensors (BFloat16). This might take a moment...")
+# Generazione tensori diretti su GPU per azzerare i colli di bottiglia del bus PCIe
+try:
+    X = torch.randn(N_SAMPLES, SEQ_LEN, D_MODEL, dtype=torch.bfloat16, device=device)
+    true_func_features = X[:, :, :D_FUNC].mean(dim=1).to(torch.float32)
+    W_true = torch.randn(D_FUNC, 1, dtype=torch.float32, device=device)
+    y = torch.matmul(true_func_features, W_true).to(torch.bfloat16)
 
-dataset = TensorDataset(X, y)
-dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+    dataset = TensorDataset(X, y)
+    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+except RuntimeError as e:
+    if "out of memory" in str(e).lower():
+        print("\n[!] FATAL ERROR: OUT OF MEMORY (OOM) DURING TENSOR GENERATION.")
+        print("This ablation requires an NVIDIA A100 (80GB) to allocate the d=8192 state.")
+        print("Execution aborted safely.")
+        exit(1)
+    else:
+        raise e
 
 # ==========================================
 # 2. ARCHITECTURAL DEFINITIONS
@@ -68,6 +79,7 @@ class Psi1a_Aligned_Model(nn.Module):
             nn.TransformerEncoderLayer(d_model=D_MODEL, nhead=32, batch_first=True, dim_feedforward=D_MODEL*4, norm_first=True), num_layers=4)
         self.functional_head = nn.Linear(D_MODEL, 1)
         self.moral_guardrail_head = nn.Linear(D_MODEL, D_MODEL - D_FUNC)
+        
     def forward(self, x):
         pooled = self.encoder(x).mean(dim=1)
         return self.functional_head(pooled), self.moral_guardrail_head(pooled)
@@ -78,6 +90,7 @@ class Psi2_Native_Model(nn.Module):
         self.encoder = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(d_model=D_FUNC, nhead=32, batch_first=True, dim_feedforward=D_FUNC*4, norm_first=True), num_layers=4)
         self.functional_head = nn.Linear(D_FUNC, 1)
+        
     def forward(self, x):
         # Epistemic Closure Operator: \Omega(z) Orthogonal Truncation
         pooled = self.encoder(x[:, :, :D_FUNC]).mean(dim=1)
@@ -87,53 +100,69 @@ class Psi2_Native_Model(nn.Module):
 # 3. ABLATION TRAINING LOOP & PROFILING
 # ==========================================
 def run_referee_proof_ablation(model, name, is_psi1a=False):
-    print(f"--------------------------------------------------\nStarting Training: {name}")
-    model = model.to(device=device, dtype=torch.bfloat16)
-    optimizer = optim.AdamW(model.parameters(), lr=1e-4) 
-    criterion = nn.MSELoss()
+    print(f"\n--------------------------------------------------")
+    print(f"Starting Training: {name}")
+    print(f"--------------------------------------------------")
     
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
-    loss_history = []
-    
-    if torch.cuda.is_available():
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-        torch.cuda.synchronize()
-        start_event.record()
-    else:
-        import time
-        start_time = time.time()
-    
-    for epoch in range(EPOCHS):
-        model.train()
-        epoch_loss = 0.0
-        for batch_X, batch_y in dataloader:
-            optimizer.zero_grad(set_to_none=True)
-            if is_psi1a:
-                logical_pred, moral_pred = model(batch_X)
-                loss_logic = criterion(logical_pred.float(), batch_y.float())
-                loss_semantic = criterion(moral_pred.float(), torch.zeros_like(moral_pred).float())
-                loss = loss_logic + (LAMBDA_SEMANTIC * loss_semantic)
-            else:
-                loss = criterion(model(batch_X).float(), batch_y.float())
-            loss.backward()
-            optimizer.step()
-            epoch_loss += loss.item()
-        loss_history.append(epoch_loss / len(dataloader))
-    
-    if torch.cuda.is_available():
-        end_event.record()
-        torch.cuda.synchronize() 
-        latency_sec = start_event.elapsed_time(end_event) / 1000.0
-        max_vram_gb = torch.cuda.max_memory_allocated() / (1024**3) 
-    else:
-        latency_sec = time.time() - start_time
-        max_vram_gb = 0.0
+    try:
+        model = model.to(device=device, dtype=torch.bfloat16)
+        optimizer = optim.AdamW(model.parameters(), lr=1e-4) 
+        criterion = nn.MSELoss()
+        
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            torch.cuda.synchronize()
+            start_event.record()
+        else:
+            start_time = time.time()
+            
+        loss_history = []
+        
+        for epoch in range(EPOCHS):
+            model.train()
+            epoch_loss = 0.0
+            
+            for batch_X, batch_y in dataloader:
+                optimizer.zero_grad(set_to_none=True)
+                if is_psi1a:
+                    logical_pred, moral_pred = model(batch_X)
+                    loss_logic = criterion(logical_pred.float(), batch_y.float())
+                    loss_semantic = criterion(moral_pred.float(), torch.zeros_like(moral_pred).float())
+                    loss = loss_logic + (LAMBDA_SEMANTIC * loss_semantic)
+                else:
+                    loss = criterion(model(batch_X).float(), batch_y.float())
+                
+                loss.backward()
+                optimizer.step()
+                epoch_loss += loss.item()
+                
+            avg_loss = epoch_loss / len(dataloader)
+            loss_history.append(avg_loss)
+            print(f"   > Epoch {epoch+1:02d}/{EPOCHS} completed | MSE Loss: {avg_loss:.4f}")
+        
+        if torch.cuda.is_available():
+            end_event.record()
+            torch.cuda.synchronize() 
+            latency_sec = start_event.elapsed_time(end_event) / 1000.0
+            max_vram_gb = torch.cuda.max_memory_allocated() / (1024**3) 
+        else:
+            latency_sec = time.time() - start_time
+            max_vram_gb = 0.0
 
-    print(f" > Net Latency: {latency_sec:.2f}s | Peak VRAM: {max_vram_gb:.2f} GB | PCOF Error (MSE): {loss_history[-1]:.4f}")
-    return loss_history, latency_sec, max_vram_gb
+        print(f"\n[RESULTS] Net Latency: {latency_sec:.2f}s | Peak VRAM: {max_vram_gb:.2f} GB | Final PCOF Error (MSE): {loss_history[-1]:.4f}")
+        return loss_history, latency_sec, max_vram_gb
+
+    except RuntimeError as e:
+        if "out of memory" in str(e).lower():
+            print("\n[!] FATAL ERROR: OUT OF MEMORY (OOM) DURING TRAINING.")
+            print("This ablation requires an NVIDIA A100 (80GB). The current GPU lacks sufficient VRAM.")
+            print("Execution aborted safely.")
+            exit(1)
+        else:
+            raise e
 
 # ==========================================
 # 4. EXECUTION
@@ -206,4 +235,4 @@ VRAM Memory Freed:       +{vram_gain:.2f}%
 with open("A100_Metrics_Summary.txt", "w") as f:
     f.write(summary_text)
 
-print("\nExecution Completed. Artifacts saved: 'A100_Ablation_Results.pdf' and 'A100_Metrics_Summary.txt'.")
+print("Execution Completed. Artifacts saved: 'A100_Ablation_Results.pdf' and 'A100_Metrics_Summary.txt'.")
